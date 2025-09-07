@@ -40,9 +40,6 @@ cd streama-client
 2. Install System Dependencies
 Open a terminal and install the core Python and PySide2 libraries.
 code Bash
-IGNORE_WHEN_COPYING_START
-IGNORE_WHEN_COPYING_END
-
     
 sudo apt-get update
 sudo apt-get install -y python3 python3-pip python3-pyside2.qtwebenginewidgets
@@ -57,9 +54,6 @@ sudo apt-get install -y python3 python3-pip python3-pyside2.qtwebenginewidgets
 
 3. Install Python Package Dependencies
 code Bash
-IGNORE_WHEN_COPYING_START
-IGNORE_WHEN_COPYING_END
-
     
 pip3 install requests
 
