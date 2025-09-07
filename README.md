@@ -5,7 +5,7 @@ A standalone desktop client for the open-source [Streama](https://github.com/str
 
 The client is built with Python and PySide2 (the official bindings for the Qt UI framework), using its powerful WebView component.
 
-![Streama Client Screenshot](streama.jpg)
+![Streama Client Screenshot](https://github.com/peterpt/Streama_Client/blob/main/streamaclient.png)
 *(Note: Replace `streama.jpg` with an actual screenshot of your running application for the best presentation.)*
 
 ## Features
