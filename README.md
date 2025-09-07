@@ -31,7 +31,7 @@ Follow these steps to get the application running on a new Linux system (Debian/
 
 **1. Clone the Repository**
 ```bash
-git clone https://your-github-repo-url/streama-client.git
+git clone https://your-github-repo-url/streama-client.git](https://github.com/peterpt/Streama_Client.git
 cd streama-client
 
   
