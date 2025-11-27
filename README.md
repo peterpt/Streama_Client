@@ -23,7 +23,7 @@ The client is built with Python and PySide6 (the official bindings for the Qt UI
 
 ### 1. System Dependencies
 *   **Python 3** (developed with 3.11+) and `pip`.
-*   **PySide6 for Qt6**, specifically the WebEngine module. This is best installed from your Linux distribution's package manager.
+*   **PySide2**, specifically the WebEngine module. This is best installed from your Linux distribution's package manager.
 
 ### 2. Python Dependencies
 *   **requests**: For handling background authentication.
@@ -40,24 +40,11 @@ cd Streama-Client
   
 
 2. Install System Dependencies
-Open a terminal and install the core Python and PySide6 libraries.
+Open a terminal and install the core Python and PySide2 libraries.
 code Bash
     
 sudo apt-get update
-sudo apt-get install -y python3 python3-pip python3-pyside6.qtwebenginewidgets
-
-  
-
-    Note for other distributions:
-
-        Fedora/RHEL: sudo dnf install python3-pyside6-webengine
-
-        Arch Linux: sudo pacman -S pyside6-webengine
-
-3. Install Python Package Dependencies
-code Bash
-    
-pip3 install requests
+sudo apt-get install -y vlc python3 python3-pip && pip install -r requirements.txt
 
 Usage
 
@@ -85,7 +72,9 @@ Project Files
 
 
 ## Notes
-there are still some minor bugs in app due to pyside6 limitations , but right now the app displays subtitles if selected before starting the media
+Dues to extreme codecs compatibilities between pyside2 and windows , and pyside6 and windows 7 this project
+will use pyside2 and vlc libraries to playback the video , vlc_libs folder exist so this app can be
+cross compiled in future for windows 7 32bit and up without requiring to install vlc on windows .
 
 License
 
