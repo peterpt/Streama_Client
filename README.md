@@ -5,7 +5,7 @@
 
 A standalone desktop client for the open-source [Streama](https://github.com/streamaserver/streama) media server. This application provides a seamless, native-like experience by wrapping the Streama web interface in a dedicated window, with added features like automatic login and integrated fullscreen control.
 
-The client is built with Python and PySide6 (the official bindings for the Qt UI framework), using its powerful WebView component.
+The client is built with Python and PySide2 (the official bindings for the Qt UI framework), using its powerful WebView component and vlc media plugins.
 
 ![Streama Client Screenshot](https://github.com/peterpt/Streama_Client/blob/main/media.png)
 
