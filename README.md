@@ -5,10 +5,20 @@ A standalone desktop client for the open-source [Streama](https://github.com/str
 
 The client is built with Python and PySide2 (the official bindings for the Qt UI framework), using its powerful WebView component and vlc media plugins.
 
-![Streama Client Screenshot](https://github.com/peterpt/Streama_Client/blob/main/media.png)
+## Pictures
 
+- Linux App
+<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/7327261e-fc2c-477a-a725-1ef0d527c8d7" />
 
-![Streama Player Screenshot](https://github.com/peterpt/Streama_Client/blob/main/app.png)
+- Player in Linux
+<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/e103372d-b432-4bfa-8fd0-6b916a9e5236" />
+
+- Settings config (any changes in subtitles sizes must be made with the app as logoff)
+<img width="317" height="394" alt="image" src="https://github.com/user-attachments/assets/cbb399f0-eb34-4311-af1e-5962f2f7ef88" />
+
+- Full screen mode in player
+<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/244febb1-88ff-4287-bd68-4b833b5be395" />
+
 ## Features
 
 *   **Seamless Auto-Login:** Configure your credentials once, and the application logs you in automatically on startup, taking you directly to the dashboard.
