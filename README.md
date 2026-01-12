@@ -68,6 +68,16 @@ Project Files
 
     settings.json: (Auto-Generated) Stores your server connection details after the first run.
 
+## Download
+this app can be run from 2 ways , using the source code in this git and installing all dependencies or
+downloading the pre compiled binaries at https://github.com/peterpt/Streama_Client/releases/tag/1.0
+The windows pre compiled binary is for windows 7 32bit/64bit and all other windows versions above
+for windows file just extract the zip file and run the app , dont forget to go to settings and configure
+your own streama server details , themoviedbapi can be skipped in config if you want .
+The linux pre compiled binary it will not run on 32bit linux OS , only in 64bit systems , to run this app
+on a 32bit linux OS use the source code instead .
+
+This app was build for a single user on streama server , multi users were not yet programmed in app .
 
 ## Notes
 Dues to extreme codecs compatibilities between pyside2 and windows , and pyside6 and windows 7 this project
