@@ -1,8 +1,6 @@
     
 # Streama Desktop Client
 
-# Project under development
-
 A standalone desktop client for the open-source [Streama](https://github.com/streamaserver/streama) media server. This application provides a seamless, native-like experience by wrapping the Streama web interface in a dedicated window, with added features like automatic login and integrated fullscreen control.
 
 The client is built with Python and PySide2 (the official bindings for the Qt UI framework), using its powerful WebView component and vlc media plugins.
@@ -17,7 +15,7 @@ The client is built with Python and PySide2 (the official bindings for the Qt UI
 *   **Integrated Fullscreen:** The player's fullscreen button is perfectly synchronized with the native desktop window. Toggling fullscreen from the web player, the `F11` key, or the `Esc` key works seamlessly.
 *   **Clean and Professional UI:** A simple menu-driven interface keeps the focus on your media content.
 *   **Self-Contained Assets:** The application icon and placeholder image are embedded directly into the application, requiring no external files after a one-time setup.
-*   **Cross-Platform:** Built with Python and Qt, it can be adapted to run on Windows, macOS, and other Linux distributions.
+*   **Cross-Platform:** Built with Python and Qt, it can be adapted to run on Windows and Linux distributions.
 
 ## Requirements
 
