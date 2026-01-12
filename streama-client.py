@@ -4,23 +4,32 @@ import json
 import base64
 import logging
 import traceback
+import ctypes.util 
 from PySide2.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, 
                                QStatusBar, QStackedWidget, QAction, QMessageBox)
 from PySide2.QtCore import Qt, Slot, QThreadPool, QTimer, QObject
 from PySide2.QtGui import QIcon, QPixmap, QPalette, QColor, QDesktopServices
 
-# --- SETUP VLC PATHS ---
-if sys.platform == "win32":
+# --- VLC DETECTION & SETUP ---
+def setup_vlc_environment():
     app_dir = os.path.dirname(os.path.abspath(__file__))
-    vlc_libs_path = os.path.join(app_dir, "vlc_libs")
-    if os.path.exists(vlc_libs_path):
-        print(f"[*] Found bundled VLC at: {vlc_libs_path}")
-        if hasattr(os, 'add_dll_directory'):
-            os.add_dll_directory(vlc_libs_path)
-        os.environ['PATH'] = vlc_libs_path + ";" + os.environ['PATH']
-        os.environ['VLC_PLUGIN_PATH'] = os.path.join(vlc_libs_path, "plugins")
-    else:
-        print(f"[!] WARNING: 'vlc_libs' folder not found at {vlc_libs_path}")
+    if sys.platform == "win32":
+        vlc_libs_path = os.path.join(app_dir, "vlc_libs")
+        if os.path.exists(vlc_libs_path):
+            if hasattr(os, 'add_dll_directory'):
+                os.add_dll_directory(vlc_libs_path)
+            os.environ['PATH'] = vlc_libs_path + ";" + os.environ['PATH']
+            os.environ['VLC_PLUGIN_PATH'] = os.path.join(vlc_libs_path, "plugins")
+            return True
+        return True 
+    elif sys.platform.startswith('linux'):
+        lib_name = ctypes.util.find_library('vlc')
+        if lib_name:
+            return True
+        return False
+    return False
+
+vlc_available = setup_vlc_environment()
 
 try:
     import assets
@@ -70,6 +79,7 @@ class MainWindow(QMainWindow):
         self.details_widget = None
         self.player_widget = None
 
+        # Load Window Icon
         if assets and hasattr(assets, 'STREAMA_ICO_B64'):
             try:
                 icon_data = base64.b64decode(assets.STREAMA_ICO_B64)
@@ -79,8 +89,20 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print(f"[!] Could not load icon from assets: {e}")
 
+        if not vlc_available:
+            QTimer.singleShot(500, self.show_vlc_error)
+
         self.initUI()
         self.update_ui_state(logged_in=False)
+
+    def show_vlc_error(self):
+        if sys.platform.startswith('linux'):
+            msg = ("VLC Media Player is not installed or not found.\n\n"
+                   "Since you are on Linux, please run:\n"
+                   "sudo apt install vlc libvlc-dev")
+        else:
+            msg = "VLC libraries not found. Please ensure the 'vlc_libs' folder exists."
+        QMessageBox.critical(self, "VLC Not Found", msg)
 
     def initUI(self):
         self.setStyleSheet("background-color: #2d2d2d; color: white;")
@@ -89,47 +111,65 @@ class MainWindow(QMainWindow):
 
         self.welcome_widget = QWidget()
         welcome_layout = QVBoxLayout(self.welcome_widget)
-        # FIX: No int cast
         welcome_layout.setAlignment(Qt.AlignCenter)
+        
+        # Add Top Stretch to center vertical content
+        welcome_layout.addStretch()
+
+        # --- LOGO LOGIC START ---
+        if assets and hasattr(assets, 'STREAMA_JPG_B64'):
+            try:
+                logo_data = base64.b64decode(assets.STREAMA_JPG_B64)
+                logo_pixmap = QPixmap()
+                logo_pixmap.loadFromData(logo_data)
+                
+                if not logo_pixmap.isNull():
+                    # Scale down if image is too large (e.g., width > 400px)
+                    if logo_pixmap.width() > 400:
+                        logo_pixmap = logo_pixmap.scaledToWidth(400, Qt.SmoothTransformation)
+                    
+                    logo_label = QLabel()
+                    logo_label.setAlignment(Qt.AlignCenter)
+                    logo_label.setPixmap(logo_pixmap)
+                    # Add some margin below the logo
+                    logo_label.setStyleSheet("margin-bottom: 20px;")
+                    welcome_layout.addWidget(logo_label)
+            except Exception as e:
+                print(f"[!] Error loading welcome logo: {e}")
+        # --- LOGO LOGIC END ---
+
         welcome_text = QLabel("Welcome to Streama Browser!\nPlease configure your server and log in.")
-        welcome_text.setStyleSheet("font-size: 20px; color: white;")
-        # FIX: No int cast
+        welcome_text.setStyleSheet("font-size: 20px; color: white; font-weight: bold;")
         welcome_text.setAlignment(Qt.AlignCenter)
-        welcome_layout.addStretch()
+        
         welcome_layout.addWidget(welcome_text)
+        
+        # Add Bottom Stretch
         welcome_layout.addStretch()
+        
         self.stacked_widget.addWidget(self.welcome_widget)
         
         self.setStatusBar(QStatusBar(self))
         self.setup_menu()
 
-    # --- FIX: FULLSCREEN LOGIC (Safe Type Casting) ---
     def toggle_fullscreen(self, checked=None):
         if self.isFullScreen():
-            # EXIT Fullscreen
             self.setWindowFlags(self.original_window_flags)
             self.showNormal()
             self.menuBar().setVisible(True)
             self.statusBar().setVisible(True)
-            
-            # Show controls if player is active
             if self.player_widget and self.stacked_widget.currentWidget() == self.player_widget:
                 self.player_widget.controls_container.setVisible(True)
                 self.player_widget.video_frame.setCursor(Qt.ArrowCursor)
         else:
-            # ENTER Fullscreen
             flags = int(Qt.Window) | int(Qt.FramelessWindowHint)
             self.setWindowFlags(Qt.WindowType(flags))
-            
             self.showFullScreen()
             self.menuBar().setVisible(False)
             self.statusBar().setVisible(False)
-            
-            # Hide controls if player is active
             if self.player_widget and self.stacked_widget.currentWidget() == self.player_widget:
                 self.player_widget.controls_container.setVisible(False)
                 self.player_widget.video_frame.setCursor(Qt.BlankCursor)
-        
         self.show()
 
     def keyPressEvent(self, event):
@@ -250,15 +290,17 @@ class MainWindow(QMainWindow):
         self.stacked_widget.setCurrentWidget(self.details_widget)
         self.statusBar().clearMessage()
 
-    # --- VLC Playback Logic ---
     @Slot(object, object)
     def prepare_video_playback(self, media_data, selected_subtitle=None):
+        if not vlc_available:
+            self.show_vlc_error()
+            return
+
         video_files = media_data.get('videoFiles', [])
         if not video_files:
             QMessageBox.critical(self, "Error", "No video file found for this item.")
             return
         
-        # Get Stream URL
         stream_url, error = self.api_client.get_stream_url(video_files[0].get('id'))
         if error:
             QMessageBox.critical(self, "Error", f"Could not get stream URL:\n{error}")
@@ -266,7 +308,6 @@ class MainWindow(QMainWindow):
             
         self.current_stream_url = stream_url
         
-        # Handle Subtitle (Download to temp if exists)
         if selected_subtitle:
             sub_id = selected_subtitle.get('id')
             sub_url, _ = self.api_client.get_stream_url(sub_id, extension='srt')
@@ -279,7 +320,6 @@ class MainWindow(QMainWindow):
                 self.threadpool.start(worker)
                 return
 
-        # If no subtitle, start immediately
         self.start_player_with_subs(None)
 
     @Slot(str)
@@ -307,7 +347,6 @@ class MainWindow(QMainWindow):
         self.stacked_widget.setCurrentWidget(self.browser_widget)
 
     def handle_logout_click(self):
-        # --- FIX: Stop player if running ---
         if self.player_widget:
             self.player_widget.stop_and_exit()
 
@@ -339,7 +378,6 @@ if __name__ == "__main__":
     sys.excepthook = handle_exception
     app = QApplication(sys.argv)
     
-    # Dark Theme
     dark_palette = QPalette()
     dark_palette.setColor(QPalette.Window, QColor(45, 45, 45))
     dark_palette.setColor(QPalette.WindowText, Qt.white)

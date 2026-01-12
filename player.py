@@ -15,16 +15,17 @@ def format_time(ms):
 
 class VLCPlayerWidget(QWidget):
     go_back = Signal()
+    
     def __init__(self, main_window):
         super().__init__(main_window)
         self.main_window = main_window
-        self.current_subtitle_file = None
         
-        # --- Initialize VLC Once ---
-        # We assume standard options here to prevent init crashes
-        self.instance = vlc.Instance('--no-xlib', '--verbose=2') 
-        self.player = self.instance.media_player_new()
-
+        # --- State Variables ---
+        self.instance = None
+        self.player = None
+        self.current_vlc_args = []
+        self.current_subtitle_file = None  # <--- FIXED: Initialized here
+        
         # --- Main Layout ---
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
@@ -93,6 +94,145 @@ class VLCPlayerWidget(QWidget):
         self.timer = QTimer(self)
         self.timer.setInterval(200)
         self.timer.timeout.connect(self.update_ui)
+        
+        # Initialize default VLC instance
+        self.init_vlc_instance()
+
+    def init_vlc_instance(self, sub_size=None, sub_bold=False):
+        """
+        Recreates the VLC instance if subtitle settings change.
+        """
+        if sub_size is None:
+            sub_size = 20
+            
+        # Build VLC Arguments
+        args = ['--no-xlib', '--verbose=2']
+        args.append(f"--freetype-fontsize={sub_size}")
+        
+        if sub_bold:
+            args.append("--freetype-bold")
+        else:
+            args.append("--no-freetype-bold")
+            
+        # If arguments haven't changed, reuse the existing instance
+        if self.instance and self.current_vlc_args == args:
+            return
+
+        print(f"[*] Initializing VLC with Subtitle Size: {sub_size}px, Bold: {sub_bold}")
+        
+        # Cleanup old player
+        if self.player:
+            self.player.stop()
+            self.player.release()
+            self.player = None
+        if self.instance:
+            self.instance.release()
+            self.instance = None
+            
+        # Create new Instance
+        try:
+            self.instance = vlc.Instance(args)
+            if not self.instance:
+                raise Exception("Failed to create VLC Instance")
+                
+            self.player = self.instance.media_player_new()
+            self.current_vlc_args = args
+            
+            # Restore volume preference
+            self.player.audio_set_volume(self.volume_slider.value())
+            
+        except Exception as e:
+            print(f"[!] VLC Initialization Error: {e}")
+            # Fallback to default
+            if "--freetype-fontsize" in str(args):
+                print("[!] Retrying with default VLC settings...")
+                self.init_vlc_instance(sub_size=None, sub_bold=False)
+
+    def play_stream(self, url, subtitle_path=None, cookie_dict=None, sub_config=None, start_time=0):
+        # 1. Save subtitle path for cleanup later
+        self.current_subtitle_file = subtitle_path  # <--- FIXED: Saved here
+
+        # 2. Extract Settings from Config
+        config = sub_config if sub_config else {}
+        size = config.get('subtitle_size', 20)
+        is_bold = config.get('subtitle_bold', False)
+
+        # 3. Ensure VLC is initialized with these settings
+        self.init_vlc_instance(sub_size=size, sub_bold=is_bold)
+        
+        if not self.player:
+            print("[!] Player not initialized, cannot play.")
+            return
+
+        # 4. Prepare Media URL (Auth)
+        play_url = url
+        if cookie_dict and 'JSESSIONID' in cookie_dict:
+            jsessionid = cookie_dict['JSESSIONID']
+            play_url = f"{url};jsessionid={jsessionid}"
+
+        media = self.instance.media_new(play_url)
+        
+        # HTTP Headers
+        if cookie_dict:
+            cookie_str = ";".join([f"{k}={v}" for k, v in cookie_dict.items()])
+            media.add_option(":http-user-agent=StreamaDesktop/1.0")
+            media.add_option(f':http-cookie="{cookie_str}"')
+            media.add_option(":http-reconnect=true")
+        
+        # Add Subtitle File
+        if subtitle_path and os.path.exists(subtitle_path):
+            media.add_option(f":sub-file={subtitle_path}")
+            
+        self.player.set_media(media)
+        
+        # Attach to Window
+        if sys.platform.startswith('linux'):
+            self.player.set_xwindow(self.video_frame.winId())
+        elif sys.platform == "win32":
+            self.player.set_hwnd(self.video_frame.winId())
+        
+        self.player.play()
+        
+        # Seek if needed
+        if start_time > 0:
+            QTimer.singleShot(250, lambda: self.player.set_time(start_time))
+
+        self.play_button.setText("Pause")
+        self.timer.start()
+
+    def toggle_playback(self):
+        if not self.player: return
+        if self.player.is_playing():
+            self.player.pause()
+            self.play_button.setText("Play")
+        else:
+            self.player.play()
+            self.play_button.setText("Pause")
+
+    def slider_pressed(self):
+        self.is_slider_active = True
+
+    def slider_released(self):
+        self.is_slider_active = False
+        if self.player:
+            pos = self.slider.value() / 1000.0
+            self.player.set_position(pos)
+
+    def slider_moved(self, val):
+        pass
+
+    def set_volume(self, val):
+        if self.player:
+            self.player.audio_set_volume(val)
+
+    def update_ui(self):
+        if self.player and not self.is_slider_active and self.player.is_playing():
+            pos = self.player.get_position()
+            if pos >= 0:
+                self.slider.setValue(int(pos * 1000))
+            cur = self.player.get_time()
+            total = self.player.get_length()
+            self.time_label.setText(f"{format_time(cur)} / {format_time(total)}")
 
     def mouseDoubleClickEvent(self, event):
         self.toggle_fullscreen()
@@ -112,93 +252,14 @@ class VLCPlayerWidget(QWidget):
         aspect_menu.addAction(ar_4_3)
         menu.exec_(self.video_frame.mapToGlobal(pos))
 
-    def play_stream(self, url, subtitle_path=None, cookie_dict=None, sub_config=None):
-        self.current_subtitle_file = subtitle_path
-        
-        # URL Rewriting for Auth
-        if cookie_dict and 'JSESSIONID' in cookie_dict:
-            jsessionid = cookie_dict['JSESSIONID']
-            url = f"{url};jsessionid={jsessionid}"
-
-        # Create Media
-        media = self.instance.media_new(url)
-        
-        # Add Headers (Cookies/UA)
-        if cookie_dict:
-            cookie_str = ";".join([f"{k}={v}" for k, v in cookie_dict.items()])
-            media.add_option(":http-user-agent=StreamaDesktop/1.0")
-            media.add_option(f':http-cookie="{cookie_str}"')
-            media.add_option(":http-reconnect=true")
-        
-        if subtitle_path and os.path.exists(subtitle_path):
-            media.add_option(f":sub-file={subtitle_path}")
-            
-            # --- APPLY SUBTITLE SETTINGS ON MEDIA ---
-            if sub_config:
-                size = sub_config.get('subtitle_size', 20)
-                is_bold = sub_config.get('subtitle_bold', False)
-                
-                print(f"[*] Applying Subtitle Settings -> Size: {size}, Bold: {is_bold}")
-                
-                # Force FreeType renderer
-                media.add_option(":text-renderer=freetype")
-                media.add_option(f":freetype-size={size}")
-                media.add_option(":freetype-color=16777215") # White
-                media.add_option(":freetype-outline-thickness=2")
-                
-                if is_bold:
-                    media.add_option(":freetype-bold")
-                else:
-                    media.add_option(":no-freetype-bold")
-            
-        self.player.set_media(media)
-        
-        if sys.platform.startswith('linux'):
-            self.player.set_xwindow(self.video_frame.winId())
-        elif sys.platform == "win32":
-            self.player.set_hwnd(self.video_frame.winId())
-        
-        self.player.play()
-        self.play_button.setText("Pause")
-        self.timer.start()
-
-    def toggle_playback(self):
-        if self.player.is_playing():
-            self.player.pause()
-            self.play_button.setText("Play")
-        else:
-            self.player.play()
-            self.play_button.setText("Pause")
-
-    def slider_pressed(self):
-        self.is_slider_active = True
-
-    def slider_released(self):
-        self.is_slider_active = False
-        pos = self.slider.value() / 1000.0
-        self.player.set_position(pos)
-
-    def slider_moved(self, val):
-        pass
-
-    def set_volume(self, val):
-        self.player.audio_set_volume(val)
-
-    def update_ui(self):
-        if not self.is_slider_active and self.player.is_playing():
-            pos = self.player.get_position()
-            if pos >= 0:
-                self.slider.setValue(int(pos * 1000))
-            cur = self.player.get_time()
-            total = self.player.get_length()
-            self.time_label.setText(f"{format_time(cur)} / {format_time(total)}")
-
     def toggle_fullscreen(self):
         self.main_window.toggle_fullscreen(not self.main_window.isFullScreen())
 
     def stop_and_exit(self):
-        self.player.stop()
+        if self.player:
+            self.player.stop()
         self.timer.stop()
+        # Clean up subtitle file
         if self.current_subtitle_file and os.path.exists(self.current_subtitle_file):
             try:
                 os.remove(self.current_subtitle_file)
