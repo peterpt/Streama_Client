@@ -58,15 +58,16 @@ Usage
 
     Login / Logout: Use the Login menu to connect to your server or to log out.
 
-    Settings: Configure your server IP/domain, port, username, and password via the Settings -> Configure Server menu. This menu is disabled while you are logged in.
+Settings: Configure your server IP/domain, port, username, and password
+via the Settings -> Configure Server menu. This menu is disabled while you are logged in.
 
-    Fullscreen:
+Fullscreen:
 
-        Click the fullscreen button inside the Streama video player.
+Click the fullscreen button inside the Streama video player.
 
-        Use the View -> Toggle Fullscreen menu item.
+Use the View -> Toggle Fullscreen menu item.
 
-        Press the F11 key to enter or exit fullscreen.
+Press the F11 key to enter or exit fullscreen.
 
         Press the Esc key to exit fullscreen.
 
@@ -95,7 +96,8 @@ will use pyside2 and vlc libraries to playback the video , vlc_libs folder exist
 cross compiled in future for windows 7 32bit and up without requiring to install vlc on windows .
 
 ## Notes 2
-App builded using Gemini Pro from goolde AI assistance (First build) and Claude Opus 4.8 from Anthropic (last code changes)
+App builded using Gemini Pro from goolde AI assistance (First build)
+and Claude Opus 4.8 from Anthropic (last code changes)
 
 License
 
