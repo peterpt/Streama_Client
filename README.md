@@ -1,5 +1,5 @@
     
-# Streama Desktop Client
+# Streama Desktop Client 2.0
 
 A standalone desktop client for the open-source [Streama](https://github.com/streamaserver/streama) media server. This application provides a seamless, native-like experience by wrapping the Streama web interface in a dedicated window, with added features like automatic login and integrated fullscreen control.
 
