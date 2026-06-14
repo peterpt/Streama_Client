@@ -1,5 +1,7 @@
 import sys
 import os
+import time
+import threading
 import vlc
 from PySide2.QtWidgets import (QWidget, QFrame, QVBoxLayout, QHBoxLayout, QPushButton, 
                                QSlider, QLabel, QSizePolicy, QMenu, QAction)
@@ -25,6 +27,22 @@ class VLCPlayerWidget(QWidget):
         self.player = None
         self.current_vlc_args = []
         self.current_subtitle_file = None  # <--- FIXED: Initialized here
+
+        # --- Continue-Watching / viewing-status reporting ---
+        self.api_client = None          # set per-playback in play_stream
+        self.current_video_id = None    # streama video id of what's playing
+        self._last_status_save = 0.0    # monotonic time of last save
+        self._status_interval = 5.0     # seconds between saves (matches web client)
+        self._completed_reported = False
+        self._pending_seek_ms = 0       # resume position to seek to
+        self._seek_attempts = 0
+
+        # --- Multi-subtitle / audio track support ---
+        # Subtitles to load as VLC slaves once playback starts. Each item:
+        # {"path": <local srt path>, "label": <display name>}.
+        self._pending_subtitle_tracks = []
+        self._subtitle_temp_files = []   # all temp srt files, for cleanup
+        self._slaves_added = False
         
         # --- Main Layout ---
         main_layout = QVBoxLayout(self)
@@ -77,7 +95,12 @@ class VLCPlayerWidget(QWidget):
 
         self.fullscreen_btn = QPushButton("Full")
         self.fullscreen_btn.clicked.connect(self.toggle_fullscreen)
-        
+
+        self.subs_btn = QPushButton("Subs")
+        self.subs_btn.clicked.connect(self.show_subtitle_menu_from_button)
+        self.audio_btn = QPushButton("Audio")
+        self.audio_btn.clicked.connect(self.show_audio_menu_from_button)
+
         self.back_button = QPushButton("Back")
         self.back_button.clicked.connect(self.stop_and_exit)
 
@@ -86,6 +109,8 @@ class VLCPlayerWidget(QWidget):
         controls_layout.addWidget(self.slider)
         controls_layout.addWidget(QLabel("Vol"))
         controls_layout.addWidget(self.volume_slider)
+        controls_layout.addWidget(self.subs_btn)
+        controls_layout.addWidget(self.audio_btn)
         controls_layout.addWidget(self.fullscreen_btn)
         controls_layout.addWidget(self.back_button)
         
@@ -148,9 +173,34 @@ class VLCPlayerWidget(QWidget):
                 print("[!] Retrying with default VLC settings...")
                 self.init_vlc_instance(sub_size=None, sub_bold=False)
 
-    def play_stream(self, url, subtitle_path=None, cookie_dict=None, sub_config=None, start_time=0):
+    def play_stream(self, url, subtitle_path=None, cookie_dict=None, sub_config=None,
+                    start_time=0, api_client=None, video_id=None, subtitle_tracks=None,
+                    preferred_sub_label=None, auto_enable_first_sub=True):
         # 1. Save subtitle path for cleanup later
-        self.current_subtitle_file = subtitle_path  # <--- FIXED: Saved here
+        # Clean up any previous subtitle temp files we won't reuse
+        self._cleanup_subtitle_files()
+        self.current_subtitle_file = subtitle_path  # primary (first) subtitle
+
+        # Build the list of subtitle tracks to load as slaves. Accept either
+        # the new subtitle_tracks list [{"path","label"}, ...] or fall back to
+        # the single subtitle_path for backward compatibility.
+        self._pending_subtitle_tracks = []
+        self._slaves_added = False
+        if subtitle_tracks:
+            self._pending_subtitle_tracks = [t for t in subtitle_tracks if t.get('path')]
+        elif subtitle_path:
+            self._pending_subtitle_tracks = [{'path': subtitle_path, 'label': 'Subtitle'}]
+        # Track temp files for cleanup.
+        self._subtitle_temp_files = [t['path'] for t in self._pending_subtitle_tracks]
+        # Preferred starting subtitle behaviour.
+        self._preferred_sub_label = preferred_sub_label
+        self._auto_enable_first_sub = auto_enable_first_sub
+
+        # 1b. Set up viewing-status reporting for this playback
+        self.api_client = api_client
+        self.current_video_id = video_id
+        self._last_status_save = 0.0
+        self._completed_reported = False
 
         # 2. Extract Settings from Config
         config = sub_config if sub_config else {}
@@ -179,10 +229,9 @@ class VLCPlayerWidget(QWidget):
             media.add_option(f':http-cookie="{cookie_str}"')
             media.add_option(":http-reconnect=true")
         
-        # Add Subtitle File
-        if subtitle_path and os.path.exists(subtitle_path):
-            media.add_option(f":sub-file={subtitle_path}")
-            
+        # Subtitles are added as "slaves" AFTER playback starts (VLC needs
+        # the media open first), so we don't add a :sub-file option here.
+
         self.player.set_media(media)
         
         # Attach to Window
@@ -192,13 +241,47 @@ class VLCPlayerWidget(QWidget):
             self.player.set_hwnd(self.video_frame.winId())
         
         self.player.play()
-        
-        # Seek if needed
-        if start_time > 0:
-            QTimer.singleShot(250, lambda: self.player.set_time(start_time))
+
+        # Load subtitle tracks as slaves once the media is open.
+        if self._pending_subtitle_tracks:
+            self._slave_attempts = 0
+            self._try_add_slaves()
+
+        # Resume: seek to start_time (ms) once VLC is actually seekable.
+        # For large MP4s over HTTP, the player needs a moment before a seek
+        # will take, so we retry until it reports seekable, then verify the
+        # position actually moved.
+        if start_time and start_time > 0:
+            self._pending_seek_ms = int(start_time)
+            self._seek_attempts = 0
+            print(f"[*] Resume requested at {start_time} ms "
+                  f"({start_time // 1000}s)")
+            self._try_resume_seek()
+        else:
+            print("[*] No resume position (starting from beginning).")
 
         self.play_button.setText("Pause")
         self.timer.start()
+
+    def _try_resume_seek(self):
+        if not self.player:
+            return
+        # Give up after ~10s of trying (40 * 250ms) for slow streams.
+        if self._seek_attempts >= 40:
+            print("[!] Resume seek gave up (player never became seekable).")
+            return
+        self._seek_attempts += 1
+
+        playing = self.player.is_playing()
+        seekable = self.player.is_seekable()
+        length = self.player.get_length()
+
+        if playing and seekable and length > 0:
+            self.player.set_time(self._pending_seek_ms)
+            print(f"[*] Resume seek applied at attempt {self._seek_attempts} "
+                  f"-> {self._pending_seek_ms} ms (length={length} ms)")
+        else:
+            QTimer.singleShot(250, self._try_resume_seek)
 
     def toggle_playback(self):
         if not self.player: return
@@ -234,12 +317,192 @@ class VLCPlayerWidget(QWidget):
             total = self.player.get_length()
             self.time_label.setText(f"{format_time(cur)} / {format_time(total)}")
 
+            # Report progress to the server (throttled to once per interval).
+            # This is what makes the item show up in "Continue Watching".
+            now = time.monotonic()
+            if now - self._last_status_save >= self._status_interval:
+                self._last_status_save = now
+                self._report_viewing_status(cur, total)
+
+    def _report_viewing_status(self, cur_ms, total_ms):
+        # VLC reports milliseconds; the server expects seconds.
+        if not self.api_client or not self.current_video_id:
+            return
+        if total_ms is None or total_ms <= 0:
+            return  # runtime not known yet; web client also skips this case
+        current_s = max(0, cur_ms / 1000.0)
+        runtime_s = total_ms / 1000.0
+        vid = self.current_video_id
+
+        # Fire on a daemon thread so a slow/unreachable server never
+        # stalls the UI or stutters playback.
+        def _send():
+            try:
+                self.api_client.save_viewing_status(vid, current_s, runtime_s)
+            except Exception as e:
+                print(f"[!] viewingStatus save failed: {e}")
+
+        threading.Thread(target=_send, daemon=True).start()
+
     def mouseDoubleClickEvent(self, event):
         self.toggle_fullscreen()
+
+    def _try_add_slaves(self):
+        """Add downloaded subtitle files to VLC as slave tracks, once the
+        media is open enough to accept them. Retries for slow streams."""
+        if not self.player or self._slaves_added:
+            return
+        if getattr(self, '_slave_attempts', 0) >= 40:
+            print("[!] Could not add subtitle slaves (media never ready).")
+            return
+        self._slave_attempts += 1
+
+        # vlc.Media.slaves_add needs the media; the player must be playing.
+        if not self.player.is_playing():
+            QTimer.singleShot(250, self._try_add_slaves)
+            return
+
+        try:
+            import vlc as _vlc
+            added = 0
+            for track in self._pending_subtitle_tracks:
+                path = track.get('path')
+                if not path or not os.path.exists(path):
+                    continue
+                # Build a proper file:// URI for the slave.
+                uri = path
+                if not uri.startswith('file://'):
+                    uri = 'file://' + os.path.abspath(path)
+                # type 0 = subtitle; 4th arg select=False so we don't force-on.
+                self.player.add_slave(_vlc.MediaSlaveType.subtitle, uri, False)
+                added += 1
+            self._slaves_added = True
+            print(f"[*] Added {added} subtitle track(s) to player.")
+            if added > 0:
+                QTimer.singleShot(300, self._apply_preferred_subtitle)
+        except Exception as e:
+            print(f"[!] add_slave failed: {e}")
+
+    def _apply_preferred_subtitle(self):
+        """Enable the right subtitle on start:
+          - if a preferred label was given (user picked one), match it;
+          - else if auto_enable_first_sub, turn on the first subtitle;
+          - else leave subtitles off."""
+        if not self.player:
+            return
+        try:
+            desc = self.player.video_get_spu_description() or []
+            # Normalize names to strings.
+            tracks = []
+            for spu_id, name in desc:
+                label = name.decode('utf-8', 'replace') if isinstance(name, bytes) else str(name)
+                tracks.append((spu_id, label))
+
+            pref = getattr(self, '_preferred_sub_label', None)
+            if pref:
+                # Find a track whose label contains the preferred label
+                # (VLC may prefix/suffix the slave name).
+                for spu_id, label in tracks:
+                    if spu_id > 0 and (pref in label or label in pref):
+                        self.player.video_set_spu(spu_id)
+                        print(f"[*] Enabled preferred subtitle: {label}")
+                        return
+                # Fall through to first if no match.
+
+            if getattr(self, '_auto_enable_first_sub', True):
+                for spu_id, label in tracks:
+                    if spu_id > 0:
+                        self.player.video_set_spu(spu_id)
+                        print(f"[*] Auto-enabled subtitle: {label}")
+                        return
+            else:
+                # Leave off (user chose "No Subtitle" among several).
+                self.player.video_set_spu(-1)
+                print("[*] Subtitles left off by user choice.")
+        except Exception as e:
+            print(f"[!] applying subtitle failed: {e}")
+
+    def _build_subtitle_menu(self, menu):
+        """Populate a menu with available subtitle tracks + Off."""
+        if not self.player:
+            return
+        try:
+            desc = self.player.video_get_spu_description() or []
+            current = self.player.video_get_spu()
+        except Exception:
+            desc, current = [], -1
+        if not desc:
+            action = QAction("No subtitles available", self)
+            action.setEnabled(False)
+            menu.addAction(action)
+            return
+        for spu_id, name in desc:
+            label = name.decode('utf-8', 'replace') if isinstance(name, bytes) else str(name)
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(spu_id == current)
+            action.triggered.connect(lambda checked, sid=spu_id: self.player.video_set_spu(sid))
+            menu.addAction(action)
+
+    def _build_audio_menu(self, menu):
+        """Populate a menu with available audio tracks."""
+        if not self.player:
+            return
+        try:
+            desc = self.player.audio_get_track_description() or []
+            current = self.player.audio_get_track()
+        except Exception:
+            desc, current = [], -1
+        if not desc or len(desc) <= 1:
+            action = QAction("Only one audio track", self)
+            action.setEnabled(False)
+            menu.addAction(action)
+            if not desc:
+                return
+        for track_id, name in desc:
+            label = name.decode('utf-8', 'replace') if isinstance(name, bytes) else str(name)
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(track_id == current)
+            action.triggered.connect(lambda checked, tid=track_id: self.player.audio_set_track(tid))
+            menu.addAction(action)
+
+    def show_subtitle_menu_from_button(self):
+        menu = QMenu(self)
+        menu.setStyleSheet("QMenu { background-color: #333; color: white; } QMenu::item:selected { background-color: #555; }")
+        self._build_subtitle_menu(menu)
+        menu.exec_(self.subs_btn.mapToGlobal(self.subs_btn.rect().topLeft()))
+
+    def show_audio_menu_from_button(self):
+        menu = QMenu(self)
+        menu.setStyleSheet("QMenu { background-color: #333; color: white; } QMenu::item:selected { background-color: #555; }")
+        self._build_audio_menu(menu)
+        menu.exec_(self.audio_btn.mapToGlobal(self.audio_btn.rect().topLeft()))
+
+    def _cleanup_subtitle_files(self):
+        """Remove all temp subtitle files from the previous playback."""
+        files = list(getattr(self, '_subtitle_temp_files', []))
+        if self.current_subtitle_file:
+            files.append(self.current_subtitle_file)
+        for path in files:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        self._subtitle_temp_files = []
+        self.current_subtitle_file = None
 
     def show_context_menu(self, pos):
         menu = QMenu(self)
         menu.setStyleSheet("QMenu { background-color: #333; color: white; } QMenu::item:selected { background-color: #555; }")
+
+        subs_menu = menu.addMenu("Subtitles")
+        self._build_subtitle_menu(subs_menu)
+        audio_menu = menu.addMenu("Audio")
+        self._build_audio_menu(audio_menu)
+        menu.addSeparator()
+
         aspect_menu = menu.addMenu("Aspect Ratio")
         ar_default = QAction("Default", self)
         ar_default.triggered.connect(lambda: self.player.video_set_aspect_ratio(None))
@@ -256,14 +519,43 @@ class VLCPlayerWidget(QWidget):
         self.main_window.toggle_fullscreen(not self.main_window.isFullScreen())
 
     def stop_and_exit(self):
+        # Capture position BEFORE stopping (stop() resets the clock).
         if self.player:
+            try:
+                cur_ms = self.player.get_time()
+                total_ms = self.player.get_length()
+            except Exception:
+                cur_ms, total_ms = -1, -1
+            self._final_viewing_status(cur_ms, total_ms)
             self.player.stop()
         self.timer.stop()
-        # Clean up subtitle file
-        if self.current_subtitle_file and os.path.exists(self.current_subtitle_file):
-            try:
-                os.remove(self.current_subtitle_file)
-            except:
-                pass
-        self.current_subtitle_file = None
+        # Clean up all subtitle temp files (may be several for multi-track).
+        self._cleanup_subtitle_files()
+        self.api_client = None
+        self.current_video_id = None
         self.go_back.emit()
+
+    def _final_viewing_status(self, cur_ms, total_ms):
+        # On exit, send one last progress update so the resume point is
+        # accurate. If the user watched to ~the end, mark it completed so
+        # it leaves "Continue Watching" instead of lingering at 99%.
+        if not self.api_client or not self.current_video_id:
+            return
+        if total_ms is None or total_ms <= 0:
+            return
+        vid = self.current_video_id
+        near_end = (cur_ms / total_ms) >= 0.95 if cur_ms >= 0 else False
+        current_s = max(0, cur_ms / 1000.0)
+        runtime_s = total_ms / 1000.0
+
+        def _send():
+            try:
+                if near_end and not self._completed_reported:
+                    self._completed_reported = True
+                    self.api_client.mark_completed(vid)
+                else:
+                    self.api_client.save_viewing_status(vid, current_s, runtime_s)
+            except Exception as e:
+                print(f"[!] final viewingStatus failed: {e}")
+
+        threading.Thread(target=_send, daemon=True).start()

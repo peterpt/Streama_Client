@@ -10,6 +10,102 @@ from PySide2.QtWidgets import (QWidget, QLabel, QVBoxLayout, QHBoxLayout,
 from PySide2.QtCore import Qt, Signal, Slot, QRunnable, QObject, QTimer
 from PySide2.QtGui import QPixmap
 
+
+def normalize_continue_watching(data):
+    """
+    The /dash/listContinueWatching endpoint returns viewing-status objects,
+    each wrapping a video, in a dict like {"total": N, "list": [...]}.
+    Each entry looks like:
+       {"id":.., "currentPlayTime":.., "lastUpdated":.., "runtime":..,
+        "video": {...}}
+
+    IMPORTANT: the Streama server writes a NEW status row for every 5-second
+    progress save, so a single watch session produces many rows for the same
+    video, all sharing the same lastUpdated but with increasing
+    currentPlayTime. We must therefore:
+      1. group all rows by video id,
+      2. for each video keep the row with the FURTHEST progress
+         (max currentPlayTime) — that's where the user actually stopped,
+      3. order the resulting one-per-video list by each video's most recent
+         timestamp (max lastUpdated), newest first.
+    """
+    if data is None:
+        return []
+    if isinstance(data, dict):
+        entries = data.get('list')
+        if entries is None:
+            for value in data.values():
+                if isinstance(value, list):
+                    entries = value
+                    break
+        if entries is None:
+            entries = []
+    elif isinstance(data, list):
+        entries = data
+    else:
+        return []
+
+    # Group by video id; track the best (furthest-progress) row and the
+    # newest timestamp seen for each video.
+    best_by_video = {}   # video_id -> media dict (the chosen one)
+    newest_ts = {}       # video_id -> max lastUpdated string
+    order = []           # preserve first-seen order for items without a vid
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if 'video' in entry and isinstance(entry['video'], dict):
+            video = entry['video']
+            cur = entry.get('currentPlayTime')
+            runtime = entry.get('runtime')
+            ts = entry.get('lastUpdated') or entry.get('dateCreated') or ''
+        else:
+            video = entry
+            cur = entry.get('currentPlayTime')
+            runtime = entry.get('runtime')
+            ts = entry.get('lastUpdated') or entry.get('dateCreated') or ''
+
+        vid = video.get('id')
+        if vid is None:
+            # No id to group on; just keep it as-is.
+            media = dict(video)
+            if cur is not None:
+                media['currentPlayTime'] = cur
+            if runtime is not None:
+                media['runtime'] = runtime
+            media['_ts'] = ts
+            order.append(media)
+            continue
+
+        # Track newest timestamp for ordering.
+        if vid not in newest_ts or ts > newest_ts[vid]:
+            newest_ts[vid] = ts
+
+        # Keep the row with the highest currentPlayTime for this video.
+        existing = best_by_video.get(vid)
+        cur_val = cur if cur is not None else -1
+        if existing is None or cur_val > existing.get('currentPlayTime', -1):
+            media = dict(video)
+            media['currentPlayTime'] = cur if cur is not None else 0
+            if runtime is not None:
+                media['runtime'] = runtime
+            best_by_video[vid] = media
+
+    # Stamp each chosen item with its video's newest timestamp for sorting.
+    chosen = []
+    for vid, media in best_by_video.items():
+        media['_ts'] = newest_ts.get(vid, '')
+        chosen.append(media)
+    chosen.extend(order)
+
+    # Newest first (lastUpdated DESC, matching the web dashboard).
+    chosen.sort(key=lambda m: m.get('_ts', ''), reverse=True)
+
+    # Drop the internal sort field before returning.
+    for m in chosen:
+        m.pop('_ts', None)
+    return chosen
+
 # --- WORKER SIGNALS & THREADS ---
 class WorkerSignals(QObject):
     login_finished = Signal(bool, str)
@@ -68,8 +164,9 @@ class FetchContinueWatchingWorker(QRunnable):
         self.signals = WorkerSignals()
     @Slot()
     def run(self):
-        videos, error = self.api_client.get_continue_watching(max_items=50)
-        self.signals.continue_watching_finished.emit(videos, error)
+        data, error = self.api_client.get_continue_watching(max_items=50)
+        media_list = normalize_continue_watching(data)
+        self.signals.continue_watching_finished.emit(media_list, error)
 
 class SearchWorker(QRunnable):
     def __init__(self, api_client, query):
@@ -127,6 +224,43 @@ class ImageDownloader(QRunnable):
             self.signals.image_finished.emit(self.target_label, pixmap)
         except requests.exceptions.RequestException as e:
             logging.error(f"Image Download Failed: {e}")
+
+class MultiSubtitleDownloadWorker(QRunnable):
+    """Downloads every subtitle for a video and returns a list of
+    {"path", "label"} dicts so the player can load them all as switchable
+    tracks. Emits via subtitle_downloaded with a JSON-encoded list (reusing
+    the existing signal) — the receiver decodes it."""
+    def __init__(self, api_client, subtitles):
+        super().__init__()
+        self.api_client = api_client
+        self.subtitles = subtitles or []
+        self.signals = WorkerSignals()
+
+    @Slot()
+    def run(self):
+        import json as _json
+        tracks = []
+        for sub in self.subtitles:
+            sub_id = sub.get('id')
+            if sub_id is None:
+                continue
+            url, _ = self.api_client.get_stream_url(sub_id, extension='srt')
+            if not url:
+                continue
+            try:
+                r = self.api_client.session.get(url, timeout=15)
+                r.raise_for_status()
+                fd, path = tempfile.mkstemp(suffix=".srt")
+                with os.fdopen(fd, 'wb') as tmp:
+                    tmp.write(r.content)
+                # Build a friendly label: language, then label, then filename.
+                label = (sub.get('language') or sub.get('label')
+                         or sub.get('originalFilename') or f"Subtitle {sub_id}")
+                tracks.append({"path": path, "label": str(label)})
+            except Exception as e:
+                print(f"[!] Subtitle {sub_id} download failed: {e}")
+        self.signals.subtitle_downloaded.emit(_json.dumps(tracks))
+
 
 class SubtitleDownloadWorker(QRunnable):
     def __init__(self, session, url):
@@ -214,6 +348,54 @@ class SettingsDialog(QDialog):
             "subtitle_size": self.subSizeInput.value(),
             "subtitle_bold": self.subBoldCheck.isChecked()
         }
+
+class ProfileSelectionDialog(QDialog):
+    """
+    Streama tracks Continue Watching per sub-profile. After login the user
+    must pick which profile they're watching as (the web client shows the
+    "Quem está assistindo?" / "Who's watching?" screen). This dialog lets
+    the user choose; the selected profile's id is then sent as the
+    'profileId' header on every request.
+    """
+    def __init__(self, profiles, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Who's watching?")
+        self.profiles = profiles or []
+        self.selected_profile = None
+
+        layout = QVBoxLayout(self)
+        label = QLabel("Select a profile:")
+        label.setStyleSheet("font-size: 16px; font-weight: bold; margin-bottom: 6px;")
+        layout.addWidget(label)
+
+        self.list_widget = QListWidget()
+        for profile in self.profiles:
+            name = profile.get('profileName') or profile.get('name') or f"Profile {profile.get('id')}"
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, profile)
+            self.list_widget.addItem(item)
+        if self.profiles:
+            self.list_widget.setCurrentRow(0)
+        self.list_widget.itemDoubleClicked.connect(self._on_double_click)
+        layout.addWidget(self.list_widget)
+
+        self.button_box = QDialogButtonBox()
+        self.button_box.addButton("Select", QDialogButtonBox.AcceptRole)
+        self.button_box.accepted.connect(self.accept)
+        layout.addWidget(self.button_box)
+
+    def _on_double_click(self, item):
+        self.accept()
+
+    def accept(self):
+        item = self.list_widget.currentItem()
+        if item:
+            self.selected_profile = item.data(Qt.UserRole)
+        super().accept()
+
+    def get_selected_profile(self):
+        return self.selected_profile
+
 
 class ClickablePosterWidget(QWidget):
     clicked = Signal(object)
@@ -366,15 +548,20 @@ class MediaDetailWidget(QWidget):
         target_label.setPixmap(pixmap.scaled(target_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
     def populate_subtitles(self):
         self.subtitle_selector.clear()
-        subtitles = self.media_data.get('subtitles', [])
-        is_visible = bool(subtitles) and not self.media_data.get('mediaType') == 'tvShow'
-        self.subtitle_label.setVisible(is_visible)
-        self.subtitle_selector.setVisible(is_visible)
-        if is_visible:
+        subtitles = self.media_data.get('subtitles', []) or []
+        is_tv = self.media_data.get('mediaType') == 'tvShow'
+        # Only show the selector when there's an actual choice to make:
+        # 2+ subtitles. With 0 or 1, we skip selection — the player loads the
+        # single subtitle (if any) automatically and enables it.
+        show_selector = (len(subtitles) >= 2) and not is_tv
+        self.subtitle_label.setVisible(show_selector)
+        self.subtitle_selector.setVisible(show_selector)
+        if show_selector:
             self.subtitle_selector.addItem("No Subtitle", userData=None)
             for sub in subtitles:
-                filename = sub.get('originalFilename', f"Subtitle ID: {sub.get('id')}")
-                self.subtitle_selector.addItem(filename, userData=sub)
+                label = (sub.get('language') or sub.get('label')
+                         or sub.get('originalFilename') or f"Subtitle {sub.get('id')}")
+                self.subtitle_selector.addItem(str(label), userData=sub)
     @Slot()
     def _on_play_clicked(self):
         selected_sub = self.subtitle_selector.currentData()
@@ -527,8 +714,7 @@ class BrowserWidget(QWidget):
             self.on_fetch_error(error)
             return
         if not isinstance(media_list, list):
-            print(f"[!] Warning: Expected list, got {type(media_list)}. Resetting to empty.")
-            media_list = []
+            media_list = list(media_list) if media_list else []
         self.add_items_to_grid(media_list)
         if not media_list and is_initial_load:
             self.load_all_movies()

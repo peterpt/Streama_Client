@@ -39,8 +39,9 @@ except ImportError:
 # IMPORT LOCAL MODULES
 from api import StreamaAPIClient
 from player import VLCPlayerWidget
-from ui_widgets import (SettingsDialog, BrowserWidget, MediaDetailWidget, 
-                       LoginWorker, FetchConfigWorker, FetchDetailsWorker, SubtitleDownloadWorker)
+from ui_widgets import (SettingsDialog, ProfileSelectionDialog, BrowserWidget, MediaDetailWidget, 
+                       LoginWorker, FetchConfigWorker, FetchDetailsWorker, SubtitleDownloadWorker,
+                       MultiSubtitleDownloadWorker)
 
 LOG_FILE = "streama_browser.log"
 logging.basicConfig(filename=LOG_FILE, filemode='w', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -245,7 +246,29 @@ class MainWindow(QMainWindow):
             logging.warning(f"Could not load TMDB config. Data: {config_data}, Error: {error}")
         else:
             self.api_client.set_tmdb_image_base_url(config_data.get("images", {}).get("secure_base_url"))
+        # Load and select a profile BEFORE fetching the dashboard. Continue
+        # Watching is scoped to the active profile, so the profileId must be
+        # set first or that list comes back empty.
+        self.select_profile()
         self.start_browser_session()
+
+    def select_profile(self):
+        profiles, perr = self.api_client.load_profiles()
+        if perr:
+            logging.warning(f"Could not load profiles: {perr}")
+            return
+        if not profiles:
+            logging.warning("No profiles returned for this user.")
+            return
+        # Always ask which profile to use (matches the web client, which
+        # shows "Who's watching?" on every login even with one profile).
+        dialog = ProfileSelectionDialog(profiles, self)
+        dialog.exec_()
+        chosen = dialog.get_selected_profile() or profiles[0]
+        profile_id = chosen.get('id')
+        self.api_client.set_current_profile_id(profile_id)
+        name = chosen.get('profileName') or chosen.get('name') or profile_id
+        self.statusBar().showMessage(f"Watching as: {name}", 4000)
 
     def start_browser_session(self):
         if not self.browser_widget:
@@ -272,6 +295,10 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def show_details(self, media_data):
+        # The clicked item (e.g. from Continue Watching) may carry a
+        # currentPlayTime resume position. The details fetch returns a fresh
+        # server object WITHOUT it, so capture it here and re-apply it after.
+        self._pending_resume_seconds = media_data.get('currentPlayTime') or 0
         worker = FetchDetailsWorker(self.api_client, media_data)
         worker.signals.details_finished.connect(self.on_details_loaded)
         worker.signals.fetch_error.connect(lambda e: QMessageBox.critical(self, "Error", f"Could not fetch details:\n{e}"))
@@ -286,6 +313,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Could not fetch details:\n{error}")
             self.stacked_widget.setCurrentWidget(self.browser_widget)
             return
+        # Re-attach the resume position that the fresh details object lacks.
+        if isinstance(details_data, dict) and getattr(self, '_pending_resume_seconds', 0):
+            details_data.setdefault('currentPlayTime', self._pending_resume_seconds)
         self.details_widget.set_media(details_data)
         self.stacked_widget.setCurrentWidget(self.details_widget)
         self.statusBar().clearMessage()
@@ -300,40 +330,84 @@ class MainWindow(QMainWindow):
         if not video_files:
             QMessageBox.critical(self, "Error", "No video file found for this item.")
             return
-        
+
         stream_url, error = self.api_client.get_stream_url(video_files[0].get('id'))
         if error:
             QMessageBox.critical(self, "Error", f"Could not get stream URL:\n{error}")
             return
-            
-        self.current_stream_url = stream_url
-        
-        if selected_subtitle:
-            sub_id = selected_subtitle.get('id')
-            sub_url, _ = self.api_client.get_stream_url(sub_id, extension='srt')
-            if sub_url:
-                self.statusBar().showMessage("Downloading subtitles...")
-                worker = SubtitleDownloadWorker(self.api_client.session, sub_url)
-                worker.signals.subtitle_downloaded.connect(self.start_player_with_subs)
-                worker.signals.subtitle_downloaded.connect(lambda: self._worker_finished(worker))
-                self.active_workers.append(worker)
-                self.threadpool.start(worker)
-                return
 
-        self.start_player_with_subs(None)
+        self.current_stream_url = stream_url
+        # Capture the streama video id (for progress reporting) and the
+        # resume position. currentPlayTime is in SECONDS (from the
+        # continue-watching normalizer); play_stream wants milliseconds.
+        self.current_video_id = media_data.get('id')
+        resume_seconds = media_data.get('currentPlayTime') or 0
+        self.current_resume_ms = int(resume_seconds * 1000)
+
+        # If the user explicitly chose a subtitle (multi-subtitle case), or
+        # explicitly chose "No Subtitle" (None), remember that so the player
+        # can start with the right track. For the single-subtitle case the
+        # dropdown is hidden and selected_subtitle is None here, but we still
+        # want that one subtitle on by default — distinguish via a flag.
+        if selected_subtitle is None:
+            # Could be "No Subtitle" picked from a multi list, OR the
+            # single/zero case where no dropdown was shown. We treat the
+            # multi-list "No Subtitle" by checking how many subs exist below.
+            self._preferred_sub_label = None
+        else:
+            self._preferred_sub_label = str(
+                selected_subtitle.get('language') or selected_subtitle.get('label')
+                or selected_subtitle.get('originalFilename')
+                or f"Subtitle {selected_subtitle.get('id')}"
+            )
+
+        # Download ALL subtitles so they can be switched inside the player
+        # (Netflix-style). If the video has none, we start with none.
+        subtitles = media_data.get('subtitles', []) or []
+        # Decide default-on behaviour: with exactly one subtitle, auto-enable
+        # it. With multiple, honour the user's pick (or off if they chose none).
+        if len(subtitles) <= 1:
+            self._auto_enable_first_sub = True
+        else:
+            self._auto_enable_first_sub = False
+
+        if subtitles:
+            self.statusBar().showMessage(f"Downloading {len(subtitles)} subtitle(s)...")
+            worker = MultiSubtitleDownloadWorker(self.api_client, subtitles)
+            worker.signals.subtitle_downloaded.connect(self.start_player_with_tracks)
+            worker.signals.subtitle_downloaded.connect(lambda: self._worker_finished(worker))
+            self.active_workers.append(worker)
+            self.threadpool.start(worker)
+            return
+
+        # No subtitles at all (e.g. native-language video).
+        self.start_player_with_tracks("[]")
 
     @Slot(str)
-    def start_player_with_subs(self, subtitle_path):
+    def start_player_with_tracks(self, tracks_json):
+        import json
+        try:
+            tracks = json.loads(tracks_json) if tracks_json else []
+        except Exception:
+            tracks = []
+
         cookies = self.api_client.session.cookies.get_dict()
-        print(f"[*] Starting playback with cookies: {cookies}")
-        
         sub_config = {
             "subtitle_size": self.settings.get("subtitle_size", 20),
             "subtitle_bold": self.settings.get("subtitle_bold", False)
         }
-        
+
         self.statusBar().showMessage("Starting Player...")
-        self.player_widget.play_stream(self.current_stream_url, subtitle_path, cookies, sub_config)
+        start_ms = getattr(self, 'current_resume_ms', 0)
+        self.player_widget.play_stream(
+            self.current_stream_url, None, cookies, sub_config,
+            start_time=start_ms,
+            api_client=self.api_client,
+            video_id=getattr(self, 'current_video_id', None),
+            subtitle_tracks=tracks,
+            preferred_sub_label=getattr(self, '_preferred_sub_label', None),
+            auto_enable_first_sub=getattr(self, '_auto_enable_first_sub', True),
+        )
         self.stacked_widget.setCurrentWidget(self.player_widget)
 
     @Slot()
