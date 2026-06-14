@@ -88,7 +88,8 @@ your own streama server details , themoviedbapi can be skipped in config if you 
 The linux pre compiled binary it will not run on 32bit linux OS , only in 64bit systems , to run this app
 on a 32bit linux OS use the source code instead .
 
-This app was build for a single user on streama server , multi users were not yet programmed in app .
+This app was build for a single user login on streama server , if 1 login contains
+multiples profiles then app will ask user to choose their profile on login
 
 ## Notes
 Dues to extreme codecs compatibilities between pyside2 and windows , and pyside6 and windows 7 this project
