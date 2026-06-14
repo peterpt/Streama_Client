@@ -94,6 +94,9 @@ Dues to extreme codecs compatibilities between pyside2 and windows , and pyside6
 will use pyside2 and vlc libraries to playback the video , vlc_libs folder exist so this app can be
 cross compiled in future for windows 7 32bit and up without requiring to install vlc on windows .
 
+## Notes 2
+App builded using Gemini Pro from goolde AI assistance (First build) and Claude Opus 4.8 from Anthropic (last code changes)
+
 License
 
 This project is licensed under the MIT License.
