@@ -11,7 +11,7 @@ The client is built with Python and PySide2 (the official bindings for the Qt UI
 <img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/7327261e-fc2c-477a-a725-1ef0d527c8d7" />
 
 - Player in Linux
-<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/e103372d-b432-4bfa-8fd0-6b916a9e5236" />
+<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/bf185663-26b6-400a-a3e3-4ce7aea27923" />
 
 - Settings config (any changes in subtitles sizes must be made with the app as logoff)
 <img width="317" height="394" alt="image" src="https://github.com/user-attachments/assets/cbb399f0-eb34-4311-af1e-5962f2f7ef88" />
