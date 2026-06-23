@@ -365,58 +365,103 @@ class VLCPlayerWidget(QWidget):
         try:
             import vlc as _vlc
             added = 0
+            failed = 0
             for track in self._pending_subtitle_tracks:
                 path = track.get('path')
                 if not path or not os.path.exists(path):
+                    print(f"[!] subtitle path missing: {path}")
                     continue
-                # Build a proper file:// URI for the slave.
-                uri = path
-                if not uri.startswith('file://'):
-                    uri = 'file://' + os.path.abspath(path)
-                # type 0 = subtitle; 4th arg select=False so we don't force-on.
-                self.player.add_slave(_vlc.MediaSlaveType.subtitle, uri, False)
-                added += 1
+                ok = self._add_one_subtitle(path)
+                if ok:
+                    added += 1
+                else:
+                    failed += 1
             self._slaves_added = True
-            print(f"[*] Added {added} subtitle track(s) to player.")
+            print(f"[*] Subtitle tracks: {added} added, {failed} failed.")
             if added > 0:
+                # The SPU description can lag behind add_slave, so retry the
+                # enable until the track actually appears.
+                self._apply_attempts = 0
                 QTimer.singleShot(300, self._apply_preferred_subtitle)
         except Exception as e:
             print(f"[!] add_slave failed: {e}")
+
+    def _add_one_subtitle(self, path):
+        """Add a single subtitle file to the player, trying the modern
+        add_slave API first and falling back to older APIs. Returns True if
+        any method reported success."""
+        import vlc as _vlc
+        abspath = os.path.abspath(path)
+
+        # Try 1: modern add_slave with a file:// URI (libVLC 3.x+).
+        try:
+            uri = abspath
+            if not uri.startswith('file://'):
+                # On Windows abspath is like C:\x; build file:///C:/x
+                uri = 'file:///' + abspath.lstrip('/').replace('\\', '/')
+            rc = self.player.add_slave(_vlc.MediaSlaveType.subtitle, uri, False)
+            # add_slave returns 0 on success, -1 on failure.
+            if rc == 0:
+                print(f"[*] add_slave OK: {os.path.basename(path)}")
+                return True
+            else:
+                print(f"[!] add_slave returned {rc} for {os.path.basename(path)}")
+        except Exception as e:
+            print(f"[!] add_slave threw: {e}")
+
+        # Try 2: legacy video_set_subtitle_file (takes a plain path).
+        try:
+            if hasattr(self.player, 'video_set_subtitle_file'):
+                rc = self.player.video_set_subtitle_file(abspath)
+                print(f"[*] video_set_subtitle_file rc={rc}: {os.path.basename(path)}")
+                return True
+        except Exception as e:
+            print(f"[!] video_set_subtitle_file threw: {e}")
+
+        return False
 
     def _apply_preferred_subtitle(self):
         """Enable the right subtitle on start:
           - if a preferred label was given (user picked one), match it;
           - else if auto_enable_first_sub, turn on the first subtitle;
-          - else leave subtitles off."""
+          - else leave subtitles off.
+        The SPU description can lag behind add_slave, so this retries until a
+        real track (spu id > 0) shows up."""
         if not self.player:
             return
         try:
             desc = self.player.video_get_spu_description() or []
-            # Normalize names to strings.
             tracks = []
             for spu_id, name in desc:
                 label = name.decode('utf-8', 'replace') if isinstance(name, bytes) else str(name)
                 tracks.append((spu_id, label))
 
+            real_tracks = [(sid, lbl) for sid, lbl in tracks if sid > 0]
+            print(f"[*] SPU description now: {tracks}")
+
+            # If no real subtitle track has appeared yet, retry for a while.
+            if not real_tracks:
+                self._apply_attempts = getattr(self, '_apply_attempts', 0) + 1
+                if self._apply_attempts <= 20:
+                    QTimer.singleShot(300, self._apply_preferred_subtitle)
+                else:
+                    print("[!] No subtitle track ever appeared in SPU list.")
+                return
+
             pref = getattr(self, '_preferred_sub_label', None)
             if pref:
-                # Find a track whose label contains the preferred label
-                # (VLC may prefix/suffix the slave name).
-                for spu_id, label in tracks:
-                    if spu_id > 0 and (pref in label or label in pref):
+                for spu_id, label in real_tracks:
+                    if pref in label or label in pref:
                         self.player.video_set_spu(spu_id)
-                        print(f"[*] Enabled preferred subtitle: {label}")
+                        print(f"[*] Enabled preferred subtitle: {label} (spu {spu_id})")
                         return
                 # Fall through to first if no match.
 
             if getattr(self, '_auto_enable_first_sub', True):
-                for spu_id, label in tracks:
-                    if spu_id > 0:
-                        self.player.video_set_spu(spu_id)
-                        print(f"[*] Auto-enabled subtitle: {label}")
-                        return
+                spu_id, label = real_tracks[0]
+                self.player.video_set_spu(spu_id)
+                print(f"[*] Auto-enabled subtitle: {label} (spu {spu_id})")
             else:
-                # Leave off (user chose "No Subtitle" among several).
                 self.player.video_set_spu(-1)
                 print("[*] Subtitles left off by user choice.")
         except Exception as e:
