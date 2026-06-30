@@ -1,3 +1,11 @@
+# Latest Changes
+- App auto reloads subtitles in case there is only 1 available in server ,
+case more exist then will prompt a selection from user
+- App will auto store movies and shows covers and also their details ftom
+tmdb in a local folder , in case tmdb goes down then no need to call it for posters
+or any data that was already stored in app
+
+
 # Changelog — Streama VLC Browser
 
 This release fixes the "Continue Watching" feature end to end and adds
