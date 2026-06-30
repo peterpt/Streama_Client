@@ -207,22 +207,41 @@ class FetchDetailsWorker(QRunnable):
             self.signals.details_finished.emit(data, error)
 
 class ImageDownloader(QRunnable):
-    def __init__(self, url, target_label, session=None):
+    def __init__(self, url, target_label, session=None, cache=None, media_id=None):
         super().__init__()
         self.url = url
         self.target_label = target_label
         self.session = session
+        self.cache = cache          # CacheManager, optional
+        self.media_id = media_id    # server id, used as cache key
         self.signals = WorkerSignals()
+
     @Slot()
     def run(self):
+        # 1. Try the local cache first — this is what makes the app work
+        #    offline once a poster has been seen.
+        if self.cache and self.media_id and self.cache.has_poster(self.media_id):
+            data = self.cache.read_poster(self.media_id)
+            if data:
+                pixmap = QPixmap()
+                if pixmap.loadFromData(data):
+                    self.signals.image_finished.emit(self.target_label, pixmap)
+                    return
+
+        # 2. Not cached (or unreadable) — fetch from the network.
         try:
             requester = self.session if self.session else requests
             response = requester.get(self.url, timeout=10)
             response.raise_for_status()
+            content = response.content
             pixmap = QPixmap()
-            pixmap.loadFromData(response.content)
-            self.signals.image_finished.emit(self.target_label, pixmap)
+            if pixmap.loadFromData(content):
+                # 3. Store in cache for next time / offline use.
+                if self.cache and self.media_id:
+                    self.cache.write_poster(self.media_id, content)
+                self.signals.image_finished.emit(self.target_label, pixmap)
         except requests.exceptions.RequestException as e:
+            # Network down and nothing cached — nothing we can show.
             logging.error(f"Image Download Failed: {e}")
 
 class MultiSubtitleDownloadWorker(QRunnable):
@@ -423,12 +442,22 @@ class ClickablePosterWidget(QWidget):
     def mousePressEvent(self, event):
         self.clicked.emit(self.media_data)
     def load_poster(self):
+        cache = getattr(self.api_client, 'cache', None) if self.api_client else None
+        cache_key = cache.make_key(self.media_data) if cache else None
+        # Cache this title's metadata so it can be browsed offline later.
+        if cache and cache_key:
+            cache.write_metadata(cache_key, self.media_data)
+
         poster_path = self.media_data.get('poster_image_src') or self.media_data.get('poster_path')
         if not poster_path:
             return
-        full_url = self.api_client.base_url + poster_path if poster_path.startswith('/') else poster_path
+        # Use a small TMDB thumbnail (w185) to keep cached images light.
+        full_url = self.api_client.cached_poster_thumb_url(poster_path)
         session = self.api_client.session if poster_path.startswith('/') else None
-        self.image_downloader = ImageDownloader(full_url, self.poster_label, session=session)
+        self.image_downloader = ImageDownloader(
+            full_url, self.poster_label, session=session,
+            cache=cache, media_id=cache_key,
+        )
         self.image_downloader.signals.image_finished.connect(self.set_poster_image)
         self.threadpool.start(self.image_downloader)
     @Slot(QLabel, QPixmap)
@@ -494,6 +523,12 @@ class MediaDetailWidget(QWidget):
         self.media_data = media_data
         self.update_details()
     def update_details(self):
+        cache = getattr(self.api_client, 'cache', None) if self.api_client else None
+        cache_key = cache.make_key(self.media_data) if cache else None
+        # Cache the full detail metadata for offline use.
+        if cache and cache_key:
+            cache.write_metadata(cache_key, self.media_data)
+
         title = self.media_data.get('title') or self.media_data.get('name', 'No Title')
         self.header.setText(f"<h1>{title}</h1>")
         self.overview_label.setText(f"<h3>Synopsis</h3><p>{self.media_data.get('overview', 'No description available.')}</p>")
@@ -506,7 +541,10 @@ class MediaDetailWidget(QWidget):
             if self.media_data.get('still_path') and not poster_path.startswith('http'):
                  full_url = self.api_client.tmdb_image_base_url + 'w300' + poster_path
                  session = None
-            self.image_downloader = ImageDownloader(full_url, self.poster_label, session=session)
+            self.image_downloader = ImageDownloader(
+                full_url, self.poster_label, session=session,
+                cache=cache, media_id=cache_key,
+            )
             self.image_downloader.signals.image_finished.connect(self.set_poster_image)
             self.threadpool.start(self.image_downloader)
         is_tv_show = self.media_data.get('mediaType') == 'tvShow'

@@ -1,11 +1,114 @@
+import os
 import requests
 import logging
 import json
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 
+class CacheManager:
+    """Local offline cache for poster thumbnails and title metadata, keyed by
+    the Streama server's media id. Lets the app display covers and details
+    without any network/TMDB access once a title has been browsed once.
+
+    Layout (created on first use, inside the app's working directory):
+        cache/
+            posters/   <id>.jpg   (small JPEG thumbnails, ~w185)
+            metadata/  <id>.json  (the media object as received)
+    """
+    def __init__(self, base_dir=None):
+        root = base_dir or os.getcwd()
+        self.cache_dir = os.path.join(root, "cache")
+        self.posters_dir = os.path.join(self.cache_dir, "posters")
+        self.metadata_dir = os.path.join(self.cache_dir, "metadata")
+        self._ensure_dirs()
+
+    def _ensure_dirs(self):
+        for d in (self.cache_dir, self.posters_dir, self.metadata_dir):
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError as e:
+                logging.error(f"Could not create cache dir {d}: {e}")
+
+    @staticmethod
+    def make_key(media_obj):
+        """Build a cache key that is unique ACROSS media types. The server
+        numbers movies, TV shows, and episodes independently, so the same
+        numeric id can belong to a movie AND a show — keying on id alone makes
+        them collide (a show would show a movie's cover). Namespacing by
+        mediaType prevents that."""
+        if not isinstance(media_obj, dict):
+            return None
+        media_id = media_obj.get('id')
+        if media_id is None:
+            return None
+        mtype = media_obj.get('mediaType') or 'item'
+        # Sanitize to keep filenames safe.
+        mtype = str(mtype).replace('/', '_').replace('\\', '_')
+        return f"{mtype}_{media_id}"
+
+    # --- Posters ---
+    def poster_path(self, media_id):
+        return os.path.join(self.posters_dir, f"{media_id}.jpg")
+
+    def has_poster(self, media_id):
+        p = self.poster_path(media_id)
+        return bool(media_id) and os.path.exists(p) and os.path.getsize(p) > 0
+
+    def read_poster(self, media_id):
+        try:
+            with open(self.poster_path(media_id), "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+
+    def write_poster(self, media_id, data):
+        if not media_id or not data:
+            return
+        try:
+            with open(self.poster_path(media_id), "wb") as f:
+                f.write(data)
+        except OSError as e:
+            logging.error(f"Could not write poster {media_id}: {e}")
+
+    # --- Metadata ---
+    def metadata_path(self, media_id):
+        return os.path.join(self.metadata_dir, f"{media_id}.json")
+
+    def has_metadata(self, media_id):
+        return bool(media_id) and os.path.exists(self.metadata_path(media_id))
+
+    def read_metadata(self, media_id):
+        try:
+            with open(self.metadata_path(media_id), "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def write_metadata(self, media_id, media_obj):
+        if not media_id or not isinstance(media_obj, dict):
+            return
+        try:
+            with open(self.metadata_path(media_id), "w", encoding="utf-8") as f:
+                json.dump(media_obj, f, ensure_ascii=False)
+        except OSError as e:
+            logging.error(f"Could not write metadata {media_id}: {e}")
+
+    def list_cached_metadata(self):
+        """Return all cached media objects (for offline browsing)."""
+        items = []
+        try:
+            for name in os.listdir(self.metadata_dir):
+                if name.endswith(".json"):
+                    obj = self.read_metadata(name[:-5])
+                    if obj:
+                        items.append(obj)
+        except OSError:
+            pass
+        return items
+
+
 class StreamaAPIClient:
-    def __init__(self):
+    def __init__(self, base_dir=None):
         self.base_url = None
         self.session = requests.Session()
         # Set a standard User-Agent (helps with some server restrictions)
@@ -17,6 +120,24 @@ class StreamaAPIClient:
         # no history and listContinueWatching returns an empty list.
         self.current_profile_id = None
         self.profiles = []
+        # Offline cache for posters + metadata. base_dir should be the app's
+        # stable directory (next to the .exe when frozen) so the cache
+        # persists across launches.
+        self.cache = CacheManager(base_dir=base_dir)
+
+    def cached_poster_thumb_url(self, poster_path):
+        """Build a SMALL TMDB thumbnail URL (w185) for a poster path, to keep
+        cached images light. Falls back to the given path if it's already a
+        full/relative non-TMDB URL (e.g. a server-hosted still)."""
+        if not poster_path:
+            return None
+        # Server-relative paths are served by Streama itself, not TMDB.
+        if poster_path.startswith('/'):
+            return self.base_url + poster_path
+        if poster_path.startswith('http'):
+            return poster_path
+        # A bare TMDB path like "/abc.jpg" combined with a small size.
+        return self.tmdb_image_base_url + 'w185' + poster_path
 
     def configure(self, server, port, ssl=False, insecure_ssl=False):
         protocol = "https" if ssl else "http"

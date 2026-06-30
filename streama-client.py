@@ -5,14 +5,74 @@ import base64
 import logging
 import traceback
 import ctypes.util 
+
+
+def _check_dependencies():
+    """Verify required third-party modules are present BEFORE we try to use
+    them. If something is missing (e.g. a user ran the source without
+    installing requirements), show a clear message instead of a raw
+    ImportError traceback. We avoid importing Qt here since Qt itself may be
+    the missing piece."""
+    required = {
+        'PySide2': "PySide2 (the GUI toolkit) — install with: pip install PySide2==5.12.6",
+        'vlc': "python-vlc (the VLC bindings) — install with: pip install python-vlc",
+        'requests': "requests (HTTP library) — install with: pip install requests",
+    }
+    missing = []
+    for module, hint in required.items():
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(hint)
+    if missing:
+        msg = ("Streama VLC Browser cannot start because some required "
+               "components are missing:\n\n  - " + "\n  - ".join(missing) +
+               "\n\nPlease install the missing components and try again.")
+        # Try a native Windows message box first (no Qt needed), then fall
+        # back to printing to the console / log.
+        try:
+            if sys.platform == "win32":
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(0, msg, "Missing Dependencies", 0x10)
+        except Exception:
+            pass
+        print(msg)
+        try:
+            with open("streama_browser.log", "a") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+        sys.exit(1)
+
+
+_check_dependencies()
+
 from PySide2.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, 
                                QStatusBar, QStackedWidget, QAction, QMessageBox)
 from PySide2.QtCore import Qt, Slot, QThreadPool, QTimer, QObject
 from PySide2.QtGui import QIcon, QPixmap, QPalette, QColor, QDesktopServices
 
 # --- VLC DETECTION & SETUP ---
+def get_app_base_dir():
+    """Return the directory the app should treat as its base for reading
+    bundled resources (vlc_libs) and writing user data (cache, settings).
+
+    - Frozen one-folder PyInstaller build: the folder containing the .exe.
+    - Running from source: the folder containing this script.
+    This is stable across launches (unlike a one-file temp dir), so cache
+    posters and settings.json persist next to the executable.
+    """
+    if getattr(sys, 'frozen', False):
+        # PyInstaller sets sys.frozen; sys.executable is the .exe path.
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_BASE_DIR = get_app_base_dir()
+
+
 def setup_vlc_environment():
-    app_dir = os.path.dirname(os.path.abspath(__file__))
+    app_dir = APP_BASE_DIR
     if sys.platform == "win32":
         vlc_libs_path = os.path.join(app_dir, "vlc_libs")
         if os.path.exists(vlc_libs_path):
@@ -21,7 +81,10 @@ def setup_vlc_environment():
             os.environ['PATH'] = vlc_libs_path + ";" + os.environ['PATH']
             os.environ['VLC_PLUGIN_PATH'] = os.path.join(vlc_libs_path, "plugins")
             return True
-        return True 
+        # vlc_libs folder is missing — VLC will not load. Report this rather
+        # than pretending everything is fine (which caused a later crash).
+        logging.error(f"vlc_libs folder not found at {vlc_libs_path}")
+        return False
     elif sys.platform.startswith('linux'):
         lib_name = ctypes.util.find_library('vlc')
         if lib_name:
@@ -43,9 +106,9 @@ from ui_widgets import (SettingsDialog, ProfileSelectionDialog, BrowserWidget, M
                        LoginWorker, FetchConfigWorker, FetchDetailsWorker, SubtitleDownloadWorker,
                        MultiSubtitleDownloadWorker)
 
-LOG_FILE = "streama_browser.log"
+LOG_FILE = os.path.join(APP_BASE_DIR, "streama_browser.log")
 logging.basicConfig(filename=LOG_FILE, filemode='w', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-SETTINGS_FILE = "settings.json"
+SETTINGS_FILE = os.path.join(APP_BASE_DIR, "settings.json")
 
 def load_settings():
     defaults = {
@@ -53,24 +116,38 @@ def load_settings():
         "username": "", "password": "", "tmdb_api_key": "",
         "subtitle_size": 20, "subtitle_bold": False
     }
+    # If no settings file exists yet (first run), create a blank one with the
+    # defaults so the user has a file to inspect/edit and the app has a stable
+    # config location next to the executable.
+    if not os.path.exists(SETTINGS_FILE):
+        try:
+            save_settings(defaults)
+            logging.info(f"Created new settings file at {SETTINGS_FILE}")
+        except Exception as e:
+            logging.error(f"Could not create settings file: {e}")
+        return dict(defaults)
     try:
         with open(SETTINGS_FILE, 'r') as f:
             settings = json.load(f)
             defaults.update(settings)
             return defaults
-    except:
-        return defaults
+    except Exception as e:
+        logging.error(f"Could not read settings ({e}); using defaults.")
+        return dict(defaults)
 
 def save_settings(settings):
-    with open(SETTINGS_FILE, 'w') as f:
-        json.dump(settings, f, indent=4)
+    try:
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump(settings, f, indent=4)
+    except Exception as e:
+        logging.error(f"Could not save settings: {e}")
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Streama VLC Browser")
         self.resize(1024, 768)
-        self.api_client = StreamaAPIClient()
+        self.api_client = StreamaAPIClient(base_dir=APP_BASE_DIR)
         self.settings = load_settings()
         self.threadpool = QThreadPool()
         self.active_workers = []
@@ -102,7 +179,14 @@ class MainWindow(QMainWindow):
                    "Since you are on Linux, please run:\n"
                    "sudo apt install vlc libvlc-dev")
         else:
-            msg = "VLC libraries not found. Please ensure the 'vlc_libs' folder exists."
+            expected = os.path.join(APP_BASE_DIR, "vlc_libs")
+            msg = ("VLC libraries were not found, so video playback is "
+                   "unavailable.\n\n"
+                   "Expected a 'vlc_libs' folder (with libvlc.dll, "
+                   "libvlccore.dll and a 'plugins' folder) here:\n"
+                   f"{expected}\n\n"
+                   "Make sure the 'vlc_libs' folder sits next to the "
+                   "application.")
         QMessageBox.critical(self, "VLC Not Found", msg)
 
     def initUI(self):
@@ -344,15 +428,9 @@ class MainWindow(QMainWindow):
         resume_seconds = media_data.get('currentPlayTime') or 0
         self.current_resume_ms = int(resume_seconds * 1000)
 
-        # If the user explicitly chose a subtitle (multi-subtitle case), or
-        # explicitly chose "No Subtitle" (None), remember that so the player
-        # can start with the right track. For the single-subtitle case the
-        # dropdown is hidden and selected_subtitle is None here, but we still
-        # want that one subtitle on by default — distinguish via a flag.
+        # Remember the user's explicit subtitle choice (multi-subtitle case),
+        # or None for "No Subtitle" / single / zero case.
         if selected_subtitle is None:
-            # Could be "No Subtitle" picked from a multi list, OR the
-            # single/zero case where no dropdown was shown. We treat the
-            # multi-list "No Subtitle" by checking how many subs exist below.
             self._preferred_sub_label = None
         else:
             self._preferred_sub_label = str(
@@ -361,15 +439,11 @@ class MainWindow(QMainWindow):
                 or f"Subtitle {selected_subtitle.get('id')}"
             )
 
-        # Download ALL subtitles so they can be switched inside the player
-        # (Netflix-style). If the video has none, we start with none.
+        # Download ALL subtitles so they can be switched inside the player.
         subtitles = media_data.get('subtitles', []) or []
-        # Decide default-on behaviour: with exactly one subtitle, auto-enable
-        # it. With multiple, honour the user's pick (or off if they chose none).
-        if len(subtitles) <= 1:
-            self._auto_enable_first_sub = True
-        else:
-            self._auto_enable_first_sub = False
+        # With exactly one subtitle, auto-enable it; with multiple, honour the
+        # user's pick (or off if they chose none).
+        self._auto_enable_first_sub = (len(subtitles) <= 1)
 
         if subtitles:
             self.statusBar().showMessage(f"Downloading {len(subtitles)} subtitle(s)...")
@@ -385,7 +459,6 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def start_player_with_tracks(self, tracks_json):
-        import json
         try:
             tracks = json.loads(tracks_json) if tracks_json else []
         except Exception:
